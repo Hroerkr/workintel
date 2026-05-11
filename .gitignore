@@ -1,0 +1,47 @@
+# ── Build output ────────────────────────────────────────────────────────────
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+publish/
+*.user
+*.suo
+*.pubxml.user
+
+# ── IDE caches ──────────────────────────────────────────────────────────────
+.vs/
+.idea/
+*.DotSettings.user
+**/.idea/.idea.*/.idea/
+
+# ── Local config / secrets ──────────────────────────────────────────────────
+# appsettings.Development.json is deliberately NOT ignored — it holds dev-time
+# logging overrides with no secrets. Personal local overrides go in *.Local.json.
+appsettings.Local.json
+appsettings.*.Local.json
+secrets.json
+.env
+.env.*
+
+# DPAPI-encrypted user prefs and any plaintext legacy config — never check in.
+preferences.dat
+config.json
+config.json.migrated.bak
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Whisper / LLM weights (downloaded at runtime, often multi-GB) ───────────
+models/
+*.ggml
+*.gguf
+*.bin
+
+# ── OS junk ─────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── Repo-bootstrap artifacts from the initial git-init transfer ─────────────
+workintel-git.tar.gz
+workintel-git.zip

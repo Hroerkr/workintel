@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>WorkIntel</RootNamespace>
+    <AssemblyName>WorkIntel</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+
+    <!-- WinForms application configuration (consumed by ApplicationConfiguration.Initialize) -->
+    <ApplicationDefaultFont>Segoe UI, 9pt</ApplicationDefaultFont>
+    <ApplicationVisualStyles>true</ApplicationVisualStyles>
+    <ApplicationUseCompatibleTextRendering>false</ApplicationUseCompatibleTextRendering>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+
+    <!-- Single-file friendly defaults; flip to true for publish -->
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <Platforms>AnyCPU;x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Allow the test project to reach internal types (ParseIntents, ComputeKey, etc.). -->
+    <InternalsVisibleTo Include="WorkIntel.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Core audio: WASAPI loopback capture, sample providers, WDL resampler -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+
+    <!-- Local transcription: managed bindings + native whisper.cpp runtime.
+         The Runtime package copies whisper native libs to the output dir.
+         For GPU: swap to Whisper.net.Runtime.Cuda (and pin to a CUDA-matching version). -->
+    <PackageReference Include="Whisper.net" Version="1.5.0" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.5.0" />
+
+    <!-- Local LLM (intent extraction): managed bindings around llama.cpp.
+         Backend.Cpu copies the CPU native libs into output dir.
+         For GPU: swap Backend.Cpu for Backend.Cuda12 / Backend.Vulkan. -->
+    <PackageReference Include="LLamaSharp" Version="0.20.0" />
+    <PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.20.0" />
+
+    <!-- DPAPI (System.Security.Cryptography.ProtectedData) is OOB on .NET Core+.
+         Per-user / per-machine encryption for the on-disk secrets blob. -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+
+    <!--
+      Stubs for later phases (uncomment as we wire each in):
+
+      HTTP / JSON for Harvest + Trello + Slack:
+        <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
+
+      Configuration:
+        <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="8.0.0" />
+    -->
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: workintel-postgres
+    environment:
+      POSTGRES_DB: workintel
+      POSTGRES_USER: workintel
+      POSTGRES_PASSWORD: workintel
+      # Tightens the LISTEN socket scope to inside the compose network +
+      # localhost on the host. Remove if you want LAN access (and add TLS
+      # before doing so).
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - workintel-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workintel -d workintel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    image: workintel-api:dev
+    container_name: workintel-api
+    build:
+      context: ..
+      dockerfile: src/WorkIntel.Api/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=workintel;Username=workintel;Password=workintel"
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  workintel-pg-data:

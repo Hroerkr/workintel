@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+option csharp_namespace = "WorkIntel.Contracts.V1";
+
+package workintel.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Read/write surface for task records owned by the desktop client.
+// Phase 1: single-user, localhost-only, no auth. The user_id field exists
+// from day 1 so multi-user is a deploy-time switch later, not a schema
+// migration.
+service TaskService {
+  // Create a new task. If id is empty, the server assigns a UUID.
+  // detected_at / status_at are server-stamped if zero.
+  rpc CreateTask(CreateTaskRequest) returns (TaskItem);
+
+  // Get a single task by id.
+  rpc GetTask(GetTaskRequest) returns (TaskItem);
+
+  // List tasks with optional status / user filters and cursor pagination.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // Change a task's status (pending → included → exported, etc.).
+  // Optionally record the export target on the way to "exported".
+  rpc UpdateTaskStatus(UpdateTaskStatusRequest) returns (TaskItem);
+
+  // Hard-delete a task.
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+
+  // Server-side stream of task events for live UI updates.
+  // The client subscribes once at app start and gets push notifications
+  // for create / update / delete without polling.
+  rpc StreamTaskEvents(StreamTaskEventsRequest) returns (stream TaskEvent);
+}
+
+message TaskItem {
+  string id = 1;
+  string user_id = 2;
+  TaskSource source = 3;
+  // Free-form JSON describing the source (sender id, channel, segment offset, etc.).
+  // Schema is consumer-defined; the API doesn't validate beyond "valid JSON string".
+  string source_meta_json = 4;
+  string original_text = 5;
+  string title = 6;
+  optional string description = 7;
+  optional string owner = 8;
+  optional string deadline = 9;
+  double confidence = 10;
+  google.protobuf.Timestamp detected_at = 11;
+  TaskStatus status = 12;
+  google.protobuf.Timestamp status_at = 13;
+  optional string export_target = 14;
+  optional google.protobuf.Timestamp exported_at = 15;
+}
+
+enum TaskSource {
+  TASK_SOURCE_UNSPECIFIED = 0;
+  TASK_SOURCE_AUDIO = 1;
+  TASK_SOURCE_SLACK = 2;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_INCLUDED = 2;
+  TASK_STATUS_EXCLUDED = 3;
+  TASK_STATUS_REMOVED = 4;
+  TASK_STATUS_EXPORTED = 5;
+}
+
+message CreateTaskRequest {
+  TaskItem task = 1;
+}
+
+message GetTaskRequest {
+  string id = 1;
+}
+
+message ListTasksRequest {
+  optional string user_id = 1;
+  optional TaskStatus status = 2;
+  optional int32 page_size = 3;    // default 50, max 500
+  optional string page_token = 4;  // opaque cursor (Phase 1 ignores; reserves for Phase 2)
+}
+
+message ListTasksResponse {
+  repeated TaskItem tasks = 1;
+  optional string next_page_token = 2;
+}
+
+message UpdateTaskStatusRequest {
+  string id = 1;
+  TaskStatus status = 2;
+  optional string export_target = 3;
+}
+
+message DeleteTaskRequest {
+  string id = 1;
+}
+
+message DeleteTaskResponse {
+  bool deleted = 1;
+}
+
+message StreamTaskEventsRequest {
+  optional string user_id = 1;
+}
+
+message TaskEvent {
+  TaskEventType type = 1;
+  TaskItem task = 2;
+  google.protobuf.Timestamp at = 3;
+}
+
+enum TaskEventType {
+  TASK_EVENT_TYPE_UNSPECIFIED = 0;
+  TASK_EVENT_TYPE_CREATED = 1;
+  TASK_EVENT_TYPE_UPDATED = 2;
+  TASK_EVENT_TYPE_DELETED = 3;
+}
