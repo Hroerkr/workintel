@@ -3,16 +3,16 @@
 A personal work-intelligence stack. Two input streams — system audio (live
 loopback transcription) and Slack DMs — feed a local LLM that extracts task
 candidates, which land in a Postgres database via a containerized gRPC API.
-A triage UI lets you Include / Exclude / Remove each task, and Included tasks
-can be exported by email to a Trello / Jira / Atlassian board.
+A triage UI lets you Include / Exclude / Remove each task; Included tasks
+can be exported by email to a Trello / Jira board.
 
-> **Status mid-pivot.** Audio path + Whisper + local LLM intent extraction are
-> working end-to-end against an in-process pipeline. The architecture is being
-> reworked to land tasks in a Postgres-backed task store fronted by a gRPC API
-> (this section is currently being built — see `src/WorkIntel.Api/`,
-> `src/WorkIntel.Data/`, `src/WorkIntel.Contracts/`, `deploy/`). The Slack
-> *listener* (incoming DMs, not outbound posts) and the desktop client's
-> rewire to the new task store come next.
+> **Status (in progress).** Working today: desktop tray app, WASAPI loopback
+> capture, Whisper transcription, local Phi-3.5 LLM extracting structured JSON
+> from each transcript, FFT + live transcript monitor, DPAPI-protected
+> settings dialog, WAV replay path for deterministic testing. The backend
+> (Postgres + gRPC service in Docker) is built and tested in isolation but
+> the desktop client hasn't been wired to it yet. Slack DM listener and
+> email export are next.
 
 ## Architecture
 
@@ -42,89 +42,100 @@ can be exported by email to a Trello / Jira / Atlassian board.
 └──────────────────────────────────────────┘
 ```
 
-Why this shape:
+Design choices, with the reasoning:
 
-- **Postgres**, not SQLite — data outlives desktop reinstalls, multi-user is a
-  config flip not a schema migration, standard admin tooling works (pgAdmin,
-  DBeaver, `psql`).
-- **gRPC** for the API surface — server-side streaming for live task updates
+- **Postgres over SQLite** — data outlives desktop reinstalls, multi-user is
+  a config flip not a schema migration, standard admin tooling works
+  (pgAdmin, DBeaver, `psql`).
+- **gRPC for the API surface** — server-side streaming for live task updates
   in the UI without polling, schema-as-code via `.proto`, generated client
-  code for free.
-- **Email export** instead of per-product API integrations — Trello and Jira
-  both support "email to board" natively. One outbound mechanism, no per-vendor
-  auth ceremony or rate-limit handling.
-- **Local LLM** — all transcript and message processing stays on the device.
-  The only outbound network call after setup is the email export (and DNS for
-  Slack DM events).
-
-> **Status:** Audio capture + tray + live monitor (FFT + transcript log) + local
-> Whisper transcription + local Phi-3.5 intent extraction + Harvest / Trello /
-> Slack dispatchers + DPAPI-encrypted preferences with a tabbed settings dialog
-> are all live. The only outbound network calls are to your own integration
-> workspaces, on a detected intent.
-
----
+  code for free. REST surface via gRPC-JSON transcoding is on the backlog
+  for `curl`-friendly debugging.
+- **Email export instead of per-product API integrations** — Trello and Jira
+  both support "email to board" natively. One outbound mechanism, no
+  per-vendor auth ceremony or rate-limit handling.
+- **Local LLM** — all transcript and message content stays on the device.
+  After first-run model downloads, the only outbound calls are the Slack
+  Socket Mode WebSocket (for DM events) and the email export.
 
 ## Stack
 
-- **.NET 8 / WinForms** — single tray executable.
-- **NAudio 2.2.1** — `WasapiLoopbackCapture` for system-wide audio + the WDL resampler.
-- **Whisper.net** — local transcription (next phase).
-- **Anthropic Claude API** — task / intent extraction (next phase).
-- **Harvest v2 / Trello / Slack Web** — action dispatch targets (next phase).
+- **.NET 8 / WinForms** desktop, **ASP.NET Core 8 gRPC** service, **Postgres 16**.
+- **NAudio 2.2** — WASAPI loopback capture + WDL resampler.
+- **Whisper.net 1.5** — local speech-to-text (Whisper.cpp under the hood).
+- **LLamaSharp 0.20** — local LLM inference (llama.cpp under the hood) running
+  **Phi-3.5 Mini Instruct** (Q4_K_M by default).
+- **EF Core 8 + Npgsql** for the data layer; **Grpc.AspNetCore** for the service.
+- **xUnit + Testcontainers** for the API test surface (real Postgres per test
+  collection).
 
 ## Project layout
 
 ```
-src/WorkIntel/
-├── Program.cs                      Entry point + single-instance guard
-├── TrayApplicationContext.cs       NotifyIcon, menu, state ↔ UI marshalling
-├── App/
-│   ├── AppState.cs                 Active / Idle / Paused
-│   ├── StateManager.cs             State machine + StateChanged event
-│   └── Log.cs                      File + Trace logger (%LOCALAPPDATA%\WorkIntel)
-├── Audio/
-│   ├── AudioCaptureService.cs      WASAPI loopback → mono → 16 kHz → segmenter
-│   ├── EnergyVad.cs                Two-threshold + hangover VAD (swap for Silero later)
-│   ├── SpeechSegmenter.cs          Frames audio, emits SpeechSegment per utterance
-│   ├── SpeechSegment.cs            Mono 16 kHz float PCM payload (Whisper-ready)
-│   ├── IAudioSink.cs               Downstream consumer interface
-│   └── LoggingAudioSink.cs         Fallback sink (logs each segment, used pre-Whisper)
-├── Transcription/
-│   ├── WhisperOptions.cs           Model size, language, threads, prompt config
-│   ├── WhisperModelStore.cs        Locate / download / atomically install ggml models
-│   ├── WhisperTranscriber.cs       ITranscriber impl; lazy model load, serialized inference
-│   └── TranscribingAudioSink.cs    IAudioSink → ITranscriber → IIntentExtractor → dispatcher
-├── Intent/
-│   ├── LocalLlmOptions.cs          Model variant, ctx size, threads, gpu offload, sampling
-│   ├── LocalLlmModelStore.cs       Locate / download / atomically install gguf weights
-│   ├── IntentSchema.cs             Well-known intent kinds + few-shot system prompt
-│   └── LocalIntentExtractor.cs     IIntentExtractor via LLamaSharp + Phi-3.5 Mini
-├── Configuration/
-│   ├── DpapiVault.cs               ProtectedData.Protect/Unprotect with app-scoped entropy
-│   ├── AppPreferences.cs           Root settings record (capture / whisper / llm / secrets)
-│   └── PreferencesStore.cs         Load / save DPAPI-encrypted blob, env-var overlay, legacy migration
-├── Integrations/
-│   ├── IntegrationSecrets.cs       Config records for Harvest / Trello / Slack
-│   ├── SecretsLoader.cs            Deprecated shim — delegates to PreferencesStore
-│   ├── BaseHttpClient.cs           Shared HttpClient lifecycle, send + non-2xx logging + JSON helpers
-│   ├── HarvestClient.cs            v2 timer start/stop + TestAsync
-│   ├── TrelloClient.cs             v1 cards.create + TestAsync
-│   ├── SlackClient.cs              chat.postMessage + TestAsync
-│   └── IntegrationDispatcher.cs    Routes intents → clients with idempotency dedup; supports hot Reload
-├── Pipeline/
-│   ├── ITranscriber.cs             Implemented by WhisperTranscriber
-│   ├── IIntentExtractor.cs         Implemented by LocalIntentExtractor (Phi-3.5)
-│   ├── IIntegrationDispatcher.cs   Implemented by IntegrationDispatcher
-│   └── LazyNativeModel.cs          Abstract base — init-once, serialized inference, drain-on-dispose
-├── UI/
-│   ├── MainWindow.cs               Layout shell + event-to-log translator
-│   ├── FftPanel.cs                 NAudio FFT, log-spaced bands, 30 fps
-│   ├── TranscriptLog.cs            Append-only log control: typed methods per event kind, internal UI marshalling, trim-on-overflow
-│   └── SettingsDialog.cs           Tabbed prefs editor with inline "Test connection" probes
-└── Tray/
-    └── TrayIconFactory.cs          Procedurally drawn tray icons (no asset deps)
+WorkIntel/
+├── README.md                          this file
+├── WorkIntel.sln
+├── .gitignore   .dockerignore
+├── deploy/
+│   └── docker-compose.yml             Postgres + API
+├── src/
+│   ├── WorkIntel/                     Windows desktop tray app
+│   ├── WorkIntel.Contracts/           .proto + generated gRPC client/server stubs
+│   ├── WorkIntel.Data/                EF Core entity + DbContext
+│   └── WorkIntel.Api/                 ASP.NET Core gRPC service (Docker)
+└── tests/
+    ├── WorkIntel.Tests/               Desktop pipeline unit tests (xUnit)
+    └── WorkIntel.Api.Tests/           gRPC service tests against Testcontainers Postgres
 ```
+
+The desktop project breaks down further:
+
+```
+src/WorkIntel/
+├── Program.cs                         Entry + single-instance guard
+├── TrayApplicationContext.cs          NotifyIcon, menu, state ↔ UI marshalling
+├── App/                               State machine, AppState enum, logging
+├── Audio/
+│   ├── AudioCaptureService.cs         WASAPI loopback → mono → 16 kHz
+│   ├── EnergyVad.cs                   Two-threshold + hangover VAD
+│   ├── SpeechSegmenter.cs             Frames audio, emits SpeechSegment per utterance
+│   ├── WaveformRingBuffer.cs          Lock-protected ring for the FFT tap
+│   └── …
+├── Transcription/
+│   ├── WhisperOptions.cs              Model, language, threads, prompt
+│   ├── WhisperModelStore.cs           Locate / download / atomically install ggml
+│   ├── WhisperTranscriber.cs          Inherits LazyNativeModel; serialized inference
+│   └── TranscribingAudioSink.cs       SpeechSegment → transcript → LLM → events
+├── Intent/
+│   ├── LocalLlmOptions.cs             Model variant, ctx size, threads, gpu, sampling
+│   ├── LocalLlmModelStore.cs          Locate / download / atomically install gguf
+│   ├── IntentSchema.cs                JSON schema + few-shot system prompt
+│   └── LocalIntentExtractor.cs        Inherits LazyNativeModel; runs the prompt
+├── Configuration/
+│   ├── DpapiVault.cs                  ProtectedData.Protect/Unprotect (user-scoped)
+│   ├── AppPreferences.cs              Root preferences record
+│   └── PreferencesStore.cs            DPAPI-encrypted save/load + legacy migration
+├── Pipeline/
+│   ├── ITranscriber.cs                Whisper plug-point
+│   ├── IIntentExtractor.cs            LLM plug-point
+│   └── LazyNativeModel.cs             Abstract base: lazy init, serialized inference, drain-on-dispose
+├── UI/
+│   ├── MainWindow.cs                  Live monitor: FFT + transcript log
+│   ├── FftPanel.cs                    Log-spaced FFT bars, 30 fps
+│   ├── TranscriptLog.cs               Append-only color-coded event log
+│   └── SettingsDialog.cs              Tabbed preferences editor
+├── Tray/
+│   └── TrayIconFactory.cs             Procedurally drawn tray icons
+└── Integrations/                      [vestigial — pending removal]
+    ├── BaseHttpClient.cs              Shared HTTP plumbing
+    ├── Harvest/Trello/SlackClient.cs  Outbound API clients from earlier design
+    └── IntegrationDispatcher.cs       Routes intents → clients
+```
+
+The `Integrations/` folder is leftover from an earlier outbound-dispatch design.
+It still compiles and tests still pass, but the LLM no longer emits intents
+that drive it. Pending removal once the new task-store path is wired through
+the desktop.
 
 ## How the audio path works
 
@@ -133,60 +144,60 @@ WasapiLoopbackCapture (IEEE float, device rate, stereo)
   → BufferedWaveProvider              (raw bytes from DataAvailable)
   → ToSampleProvider                  (interleaved float)
   → StereoToMono / MultiChannelToMono (downmix when needed)
-  → WdlResamplingSampleProvider       (→ 16 kHz)
+  → WdlResamplingSampleProvider       (→ 16 kHz mono)
   → SpeechSegmenter                   (320-sample frames; energy VAD; segment buffer)
   → TranscribingAudioSink.PushAsync   (thread-pool hop)
   → WhisperTranscriber.TranscribeAsync (serialized native inference)
-  → TranscriptionResult               (text + language; logged + Transcribed event)
-  → LocalIntentExtractor.ExtractAsync (Phi-3.5 Mini, JSON output)
-  → DetectedIntent[]                  (also surfaced via IntentsDetected event for the UI)
-  → IntegrationDispatcher.DispatchAsync (Harvest / Trello / Slack with 60-s dedupe window)
+  → TranscriptionResult               (text + language; surfaced via Transcribed event)
+  → LocalIntentExtractor.ExtractAsync (Phi-3.5 Mini; JSON output)
+  → DetectedIntent[]                  (surfaced via IntentsDetected event for the UI)
 ```
 
-A separate tap from `AudioCaptureService.Waveform` (a thread-safe ring buffer of
-the most-recent ~512 ms of post-resample samples) feeds the FFT panel without
-being on the hot audio path.
+A separate tap from `AudioCaptureService.Waveform` (a thread-safe ring buffer
+of the most-recent ~512 ms of post-resample samples) feeds the FFT panel
+without sitting on the hot audio path.
 
-Reads happen synchronously inside `DataAvailable`; the only thread-pool hop is the
-final segment dispatch, so the audio thread is never blocked by downstream work.
+Reads happen synchronously inside `DataAvailable`; the only thread-pool hop
+is the final segment dispatch, so the audio thread is never blocked by
+downstream work.
 
 ## Whisper bootstrap
 
-On first run, `WhisperModelStore.EnsureAsync` downloads the configured ggml model
-from `huggingface.co/ggerganov/whisper.cpp` into `%LOCALAPPDATA%\WorkIntel\models\`,
-streamed with progress logging and atomically renamed into place. Subsequent runs
-load instantly from disk.
+On first run, `WhisperModelStore.EnsureAsync` downloads the configured ggml
+model from `huggingface.co/ggerganov/whisper.cpp` into
+`%LOCALAPPDATA%\WorkIntel\models\`, streamed with progress logging and
+atomically renamed into place. Subsequent runs load instantly from disk.
 
-The default is `base.en` (~140 MB, ~1× realtime on a modern CPU). To change models
-or language, edit `WhisperOptions` in `Program.cs`:
+The default is `base.en` (~140 MB, ~1× realtime on a modern CPU). To change
+models or language, edit `WhisperOptions` in `Program.cs`:
 
 ```csharp
 var whisperOptions = new WhisperOptions
 {
     Model = WhisperModel.SmallEn,            // or TinyEn / MediumEn / LargeV3
     Language = "auto",                       // or "en", "de", …
-    InitialPrompt = "WorkIntel, Harvest, Trello",  // bias toward in-domain vocab
+    InitialPrompt = "WorkIntel, Phi, Whisper", // bias toward in-domain vocab
     Translate = false,
 };
 ```
 
-GPU acceleration: replace the `Whisper.net.Runtime` package reference with
-`Whisper.net.Runtime.Cuda` (CUDA) or `Whisper.net.Runtime.CoreML` (macOS).
+GPU acceleration: swap `Whisper.net.Runtime` for `Whisper.net.Runtime.Cuda`
+(CUDA) or `Whisper.net.Runtime.CoreML` (macOS).
 
-## Intent extraction (local LLM)
+## Local LLM (Phi-3.5)
 
 Transcripts are handed off to **Phi-3.5 Mini Instruct** running locally via
-LLamaSharp. The model produces a JSON array of typed intents, parsed by
-`LocalIntentExtractor` and forwarded to the dispatcher. Nothing about the audio,
-transcript, or extracted intents leaves the machine.
+LLamaSharp. The model produces a JSON array conforming to the schema in
+`Intent/IntentSchema.cs`. Nothing about the audio, transcript, or LLM output
+leaves the machine.
 
 Model variants and approximate disk footprint:
 
-| Variant                     | Quant   | Disk   | Quality vs. speed                |
-|-----------------------------|---------|--------|----------------------------------|
-| `Phi35MiniInstructQ4` (default) | Q4_K_M | ~2.4 GB | Fastest, good enough for intent  |
-| `Phi35MiniInstructQ5`       | Q5_K_M  | ~2.8 GB | Marginally better at JSON output |
-| `Phi35MiniInstructQ8`       | Q8_0    | ~4.0 GB | Near-lossless; slower             |
+| Variant                          | Quant   | Disk    | Notes                              |
+|----------------------------------|---------|---------|------------------------------------|
+| `Phi35MiniInstructQ4` (default)  | Q4_K_M  | ~2.4 GB | Fastest, good enough for the task  |
+| `Phi35MiniInstructQ5`            | Q5_K_M  | ~2.8 GB | Marginally better at JSON output   |
+| `Phi35MiniInstructQ8`            | Q8_0    | ~4.0 GB | Near-lossless; slower              |
 
 Configure via `LocalLlmOptions` in `Program.cs`:
 
@@ -201,114 +212,25 @@ var llmOptions = new LocalLlmOptions
 };
 ```
 
-GPU offload: replace `LLamaSharp.Backend.Cpu` with `LLamaSharp.Backend.Cuda12` or
-`LLamaSharp.Backend.Vulkan` and set `GpuLayerCount` (Phi-3.5 Mini has 33 layers
-total).
+GPU offload: replace `LLamaSharp.Backend.Cpu` with `LLamaSharp.Backend.Cuda12`
+or `LLamaSharp.Backend.Vulkan` and set `GpuLayerCount` (Phi-3.5 Mini has 33
+layers total).
 
-The system prompt + few-shot examples live in `Intent/IntentSchema.cs`. Add a new
-intent kind by: (1) adding a constant + one example to the prompt, (2) adding a
-handler in the dispatcher.
-
-### Current intent focus: Slack only
-
-The system prompt is currently **scoped to Slack `chat.postMessage` only**.
-Harvest and Trello dispatcher handlers remain in code (and their constants
-in `IntentSchema`) so re-enabling them later is just a prompt edit, but the
-LLM won't emit those intents in this iteration. The goal is to nail one
-integration end-to-end before broadening surface area.
-
-To re-enable an integration, edit the system prompt in
-`Intent/IntentSchema.cs`: add the intent kind to the "Available intent
-kinds" section, add one or two positive examples, and (importantly) keep
-the existing negative examples so the model stays conservative.
-
-## Setting up Slack
-
-You need a Slack bot token (`xoxb-...`). One-time setup:
-
-1. Open https://api.slack.com/apps → **Create New App** → **From scratch**.
-   - Name: anything ("WorkIntel" works); pick your workspace.
-2. In the app config, go to **OAuth & Permissions**.
-3. Under **Scopes → Bot Token Scopes**, add `chat:write`. (Optionally also
-   `chat:write.public` if you want the bot to post to channels it isn't
-   explicitly a member of.)
-4. Scroll up to **OAuth Tokens for Your Workspace** → **Install to Workspace**
-   → review and authorize.
-5. Copy the **Bot User OAuth Token** (starts with `xoxb-`).
-6. In WorkIntel: tray → **Settings…** → **Slack** tab → paste into **Bot token**.
-   Set **Default channel** to the channel you want as the fallback target
-   when the user doesn't name one (e.g. `#general`).
-7. Click **Test connection** — should report `✓ connected as <bot name> in <workspace>`.
-8. Save. The dispatcher hot-reloads; no restart needed.
-9. In Slack, add the bot to any channel you want it to post to:
-   `#channel` → **integrations** → **Add an App** → pick your WorkIntel bot.
-   (Skip this step if you added `chat:write.public` in step 3.)
-
-### Verifying with the replay path
-
-Record yourself saying something like *"Slack the team in #general that I'm
-testing WorkIntel"* — Windows Voice Recorder app works fine, save as `.m4a`
-or `.wav`. Then:
-
-1. Tray → **Replay audio file…** → pick the recording.
-2. Live monitor opens automatically.
-3. You should see, in order:
-   - The transcript line (cyan): `HH:MM:SS [en] Slack the team in #general that I'm testing WorkIntel`
-   - The intent line (green): `→ slack.post_message  (conf 0.9X)  channel=#general, text=I'm testing WorkIntel`
-   - The dispatch outcome (green ✓ if it landed, red ✗ if not):
-     `✓ slack.post_message — slack message posted to C0123456`
-
-If the dispatch fails, the message after the `✗` tells you what to fix:
-
-| Outcome message | What to do |
-|---|---|
-| `slack not configured` | Bot token field is empty in Settings. |
-| `Slack chat.postMessage failed: not_in_channel` | Add the bot to the target channel (Slack `#channel` → integrations). |
-| `Slack chat.postMessage failed: channel_not_found` | Channel name doesn't match — try with/without the `#`, or use the channel ID. |
-| `Slack chat.postMessage failed: invalid_auth` | Token rejected. Regenerate in Slack app config. |
-| `Slack chat.postMessage failed: missing_scope` | Bot lacks `chat:write`. Add the scope in OAuth & Permissions, reinstall the app, copy the new token. |
-
-### Tips
-
-- The model is good at extracting the text *content* even when the speaker
-  phrases the request awkwardly. "Hey, can you tell the eng channel that the
-  build is green" → `channel: engineering` (without `#`, Slack still resolves
-  it), `text: "The build is green"`.
-- It's deliberately conservative on partial intents. "I should probably let
-  the team know" → `[]` (no destination *and* no message text).
-- The dispatcher dedupes intents within 60 s by `kind + sorted(params)` —
-  saying the same thing twice in quick succession only posts once.
-
-## Tray states
-
-| State    | Icon  | Meaning                                                         |
-|----------|-------|-----------------------------------------------------------------|
-| Active   | green | Capture is running; speech detected within the idle window.     |
-| Idle     | grey  | Capture is running; no speech for `IdleAfter` (default 45 s).   |
-| Paused   | amber | User paused via the menu / tray double-click. Capture is gated. |
-
-Double-clicking the tray icon opens the live monitor. Pause/resume is on the
-right-click menu.
-
-## Tray menu
-
-- **Show live monitor…** (`Ctrl+Shift+W`) — opens the FFT + transcript window.
-- **Pause / Resume capture** — toggles loopback capture.
-- **Replay audio file…** — pick a WAV/MP3, watch the pipeline process it in
-  real time. The single best smoke test for the whole stack.
-- **Open log folder** — `%LOCALAPPDATA%\WorkIntel\` in Explorer.
-- **Settings…** (`Ctrl+Shift+S`) — model / VAD / integration credentials.
-- **Exit** — only this actually shuts down the app; closing the live monitor
-  just hides it.
+The system prompt + few-shot examples live in `Intent/IntentSchema.cs`. The
+prompt is in transition — the current shape is geared toward the (now
+deprecated) outbound-dispatch model. It's being rewritten into a
+"task candidate" schema (`title`, `description`, `owner`, `deadline`,
+`confidence`, `source_quote`) as part of wiring the desktop into the new
+backend.
 
 ## Building
 
-The repo now has two halves: a Windows desktop app and a containerized API/DB
+The repo has two halves: a Windows desktop app and a containerized API + DB
 backend. Build instructions per half.
 
 ### Backend (Postgres + API in Docker)
 
-Requires Docker Desktop (Windows / Mac) or any docker engine + compose plugin.
+Requires Docker Desktop (Windows / Mac) or any Docker engine + Compose plugin.
 
 ```powershell
 cd deploy
@@ -323,23 +245,24 @@ That starts:
 Quick sanity checks:
 
 ```powershell
-# Liveness probe (REST):
+# Liveness probe (REST)
 curl http://localhost:5000/health
 # → {"status":"ok"}
 
-# Drop into the database:
+# Drop into the database
 docker compose exec postgres psql -U workintel -d workintel -c "\dt"
 # → should list the `tasks` table
 
-# Stop everything:
+# Stop everything
 docker compose down
-# Stop everything AND wipe the database volume:
+# Stop everything AND wipe the database volume
 docker compose down -v
 ```
 
-The API applies the schema on startup via EF Core's `EnsureCreatedAsync`. Once
-the schema stabilises we'll switch to proper migrations (`dotnet ef migrations
-add …`); for the POC, deleting the volume and restarting recreates the schema.
+The API applies the schema on startup via EF Core's `EnsureCreatedAsync`.
+Once the schema stabilises we'll switch to proper migrations
+(`dotnet ef migrations add …`); for the POC, deleting the volume and
+restarting recreates the schema.
 
 ### Desktop app
 
@@ -351,15 +274,16 @@ dotnet run --project src\WorkIntel\WorkIntel.csproj
 
 Logs land in `%LOCALAPPDATA%\WorkIntel\workintel.log`.
 
-The desktop app will (after the Phase 2 wire-up) connect to the API at
-`http://localhost:5000` by default. Connection string lives in the Settings
-dialog → Backend tab (not yet wired in this commit).
+The desktop app currently runs the in-process pipeline only. Wiring it to
+the gRPC backend is the next phase — it'll connect to
+`http://localhost:5000` by default with the endpoint and credentials stored
+in the DPAPI-protected preferences blob.
 
 ## First run — what to expect
 
-The first time you launch WorkIntel, a tray icon appears immediately but the
-intelligence isn't ready yet. **Two model files have to download** before
-transcription and intent extraction work:
+The first time you launch WorkIntel, a tray icon appears immediately but
+the intelligence isn't ready yet. **Two model files have to download** before
+transcription and LLM extraction work:
 
 - `ggml-base.en.bin` (~140 MB) — Whisper, English-only base model.
 - `Phi-3.5-mini-instruct-Q4_K_M.gguf` (~2.4 GB) — Phi-3.5 Mini, 4-bit quant.
@@ -371,10 +295,10 @@ To watch the download progress: tray → "Open log folder" → `workintel.log`,
 or `Get-Content -Wait workintel.log` in PowerShell. You'll see lines like:
 
 ```
-2026-05-08 14:02:11.345 [INFO ] [  3] downloading whisper model: ggml-base.en.bin from huggingface.co/...
-2026-05-08 14:02:13.012 [INFO ] [  4] whisper model download: 23 / 142 MB (16.2%)
-2026-05-08 14:02:18.880 [INFO ] [  3] whisper processor ready
-2026-05-08 14:02:19.110 [INFO ] [  5] downloading local LLM: Phi-3.5-mini-instruct-Q4_K_M.gguf from huggingface.co/...
+… [INFO ] downloading whisper model: ggml-base.en.bin from huggingface.co/…
+… [INFO ] whisper model download: 23 / 142 MB (16.2%)
+… [INFO ] whisper processor ready
+… [INFO ] downloading local LLM: Phi-3.5-mini-instruct-Q4_K_M.gguf from huggingface.co/…
 ```
 
 Behind a corporate proxy or with HF blocked? Drop the files into the models
@@ -383,26 +307,25 @@ cached and skip the download.
 
 ## Verifying it works (replay path)
 
-You can verify the full pipeline end-to-end without saying anything out loud or
-playing media through your system: tray → **"Replay audio file…"** → pick a WAV
-or MP3. The file streams through the same audio path that WASAPI loopback
-feeds, in real time. Live capture is suppressed for the duration so the
-display stays clean.
+You can drive the full pipeline end-to-end without saying anything out
+loud or playing media through your system: tray → **"Replay audio file…"**
+→ pick a WAV or MP3. The file streams through the same audio path WASAPI
+loopback feeds, in real time. Live capture is suppressed for the duration
+so the display stays clean.
 
 What you should see in the live monitor:
 
 1. The FFT bars respond to whatever audio is playing.
-2. As Whisper closes each VAD-bounded segment (a sentence or two of speech),
-   a transcript line appears in cyan, prefixed with `HH:MM:SS [language]`.
-3. As Phi-3.5 finds an intent, a green `→ kind  (conf 0.92)  key=value, …`
-   line appears below the transcript.
-4. State transitions (Active → Idle → Active) appear as muted italic lines.
+2. As Whisper closes each VAD-bounded segment (a sentence or two of
+   speech), a transcript line appears in cyan, prefixed with
+   `HH:MM:SS [language]`.
+3. If the LLM extracts anything from the transcript, a green
+   `→ kind  (conf 0.92)  key=value, …` line appears below.
+4. State transitions (Active ↔ Idle) appear as muted italic lines.
 
-If the file is purely instrumental music or background noise, you should see
-the FFT respond but no transcripts (the VAD discards sub-min energy and
-Whisper produces empty output for non-speech). That's the expected behaviour;
-to verify transcription you need a clip with at least a few seconds of
-intelligible speech.
+If the file is purely instrumental music or background noise, you should
+see the FFT respond but no transcripts — VAD discards sub-min energy and
+Whisper produces empty output for non-speech.
 
 The simplest local test material is a short voice memo recorded with the
 Windows Voice Recorder app, exported as M4A or WAV.
@@ -415,9 +338,63 @@ Once the models are loaded:
 2. Play any audio with speech — a YouTube video, a podcast, a video call.
 3. Watch the FFT and the log.
 
-Recommended for the first end-to-end sanity check: read this sentence aloud
-into a video call you're hosting, with WorkIntel running. You should see your
-own audio's FFT and a transcript of the sentence.
+## Tray states
+
+| State    | Icon  | Meaning                                                         |
+|----------|-------|-----------------------------------------------------------------|
+| Active   | green | Capture is running; speech detected within the idle window.     |
+| Idle     | grey  | Capture is running; no speech for `IdleAfter` (default 45 s).   |
+| Paused   | amber | User paused via the menu / tray double-click. Capture is gated. |
+
+Double-clicking the tray icon opens the live monitor. Pause/resume is on
+the right-click menu.
+
+## Tray menu
+
+- **Show live monitor…** (`Ctrl+Shift+W`) — opens the FFT + transcript window.
+- **Pause / Resume capture** — toggles loopback capture.
+- **Replay audio file…** — pick a WAV/MP3, watch the pipeline process it in
+  real time. The single best smoke test for the whole stack.
+- **Open log folder** — `%LOCALAPPDATA%\WorkIntel\` in Explorer.
+- **Settings…** (`Ctrl+Shift+S`) — model / VAD / preferences.
+- **Exit** — only this actually shuts the app down; closing the live
+  monitor just hides it.
+
+## Live monitor window
+
+Tray → "Show live monitor…" (or `Ctrl+Shift+W`, or double-click the tray
+icon) opens an inspector window with two panes:
+
+- **FFT spectrum** — log-frequency bars from 80 Hz to ~7.8 kHz, peak-hold
+  smoothed, ~30 fps. Polls `WaveformRingBuffer` on a UI timer; no event
+  coupling.
+- **Live log** — scrolling color-coded feed of every transcript and every
+  LLM output. Self-trims to ~200 KB to stay snappy on long sessions.
+
+Closing the window only hides it; only the tray "Exit" item shuts the
+app down.
+
+## Settings & credentials
+
+Tray → "Settings…" (or `Ctrl+Shift+S`) opens a tabbed editor:
+
+- **Capture** — idle threshold, VAD activation / deactivation thresholds,
+  hangover.
+- **Whisper** — model, language, initial prompt, translate flag, threads.
+- **Phi-3.5 LLM** — model variant, context size, threads, GPU offload,
+  temperature.
+
+A **Backend** tab will be added when the desktop wires up to the gRPC
+service — it'll hold the API endpoint URL and (eventually) an
+auth token, both stored alongside everything else in the DPAPI-encrypted
+preferences blob.
+
+Storage: `%LOCALAPPDATA%\WorkIntel\preferences.dat`. The outer JSON wrapper
+is plaintext (schema version + save timestamp) so you can confirm
+"what's stored" without DPAPI; the inner blob is encrypted with
+`ProtectedData.Protect` scoped to the current user with app-specific
+entropy. The blob is therefore non-portable across machines or user
+accounts.
 
 ## Testing
 
@@ -428,150 +405,106 @@ dotnet test
 Two test projects:
 
 - `tests\WorkIntel.Tests\` — desktop pipeline units (VAD, segmenter, ring
-  buffer, intent JSON parser, idempotency, preferences, state machine,
-  lifecycle base, HTTP client base, log control).
-- `tests\WorkIntel.Api.Tests\` — gRPC API tests against a real Postgres in a
-  Testcontainers-managed container. Each run pulls (or reuses cached)
-  `postgres:16-alpine`, boots a fresh DB, applies the schema, exercises the
-  full CRUD path through the gRPC client. **Requires Docker to be running on
-  the test host** (the Testcontainers prerequisite, not WorkIntel-specific).
+  buffer, JSON parser, idempotency, preferences, state machine, lifecycle
+  base, HTTP client base, log control). 77 tests, ~1.5 s wall.
+- `tests\WorkIntel.Api.Tests\` — gRPC API tests against a real Postgres in
+  a Testcontainers-managed container. Each run pulls (or reuses cached)
+  `postgres:16-alpine`, boots a fresh DB, applies the schema, exercises
+  the full CRUD path through the gRPC client. **Requires Docker to be
+  running on the test host** (Testcontainers prerequisite, not
+  WorkIntel-specific).
 
-No external mocking framework. No fixture audio files — anything that touches
-a real Whisper model, LLamaSharp weights, or live external APIs is left out of
-the unit-test surface and tested manually via the replay path. Coverage focuses on the gnarly pure-logic units where
-regressions hurt:
+Coverage focuses on the pure-logic units where regressions hurt:
 
-- `EnergyVadTests` — activation/deactivation thresholds, hangover, max-segment force-close, reset.
-- `SpeechSegmenterTests` — silence, full speech-then-silence emission cycle, sub-min discard, reset.
-- `LocalIntentExtractorTests` — JSON parsing robustness (markdown fences, trailing prose, malformed input, brackets in strings, the `none` filter).
-- `WaveformRingBufferTests` — under-fill, exact-fill, over-fill, wrap-around, multiple writes.
-- `IntegrationDispatcherTests` — `ComputeKey` stability + `IsDuplicate` window behavior.
-- `StateManagerTests` — Idle ↔ Active ↔ Paused transitions, no-op detection, paused-ignores-speech.
-- `PreferencesStoreTests` — DPAPI round-trip, legacy `config.json` migration, secrets aren't visible in the on-disk wrapper, atomic overwrite.
-- `LazyNativeModelTests` — lifecycle contract for the model-loading base class: warmup idempotency, race-free init under 16-way concurrent first-touch, failure caching, dispose drain + timeout, idempotent dispose, post-dispose `EnsureInitializedAsync` throws.
-- `BaseHttpClientTests` — driven by a stub `HttpMessageHandler`: path resolution against the base URL, user-agent passthrough, JSON GET/POST round-trip, content-type header, non-2xx → `HttpRequestException` with status in the message, transport failure passthrough, body truncation, cancellation propagation.
+- `EnergyVadTests` — activation/deactivation thresholds, hangover,
+  max-segment force-close, reset.
+- `SpeechSegmenterTests` — silence, full speech-then-silence emission
+  cycle, sub-min discard, reset.
+- `LocalIntentExtractorTests` — JSON parsing robustness (markdown fences,
+  trailing prose, malformed input, brackets in strings, the `none` filter).
+- `WaveformRingBufferTests` — under-fill, exact-fill, over-fill,
+  wrap-around, multiple writes.
+- `StateManagerTests` — Idle ↔ Active ↔ Paused transitions, no-op
+  detection, paused-ignores-speech.
+- `PreferencesStoreTests` — DPAPI round-trip, legacy `config.json`
+  migration, secrets aren't visible in the on-disk wrapper, atomic
+  overwrite.
+- `LazyNativeModelTests` — lifecycle contract for the model-loading base
+  class: warmup idempotency, race-free init under 16-way concurrent
+  first-touch, failure caching, dispose drain + timeout, idempotent
+  dispose, post-dispose `EnsureInitializedAsync` throws.
+- `BaseHttpClientTests` — stub `HttpMessageHandler`: path resolution
+  against the base URL, user-agent passthrough, JSON GET/POST round-trip,
+  content-type header, non-2xx → `HttpRequestException` with status in
+  the message, transport failure passthrough, body truncation,
+  cancellation propagation.
+- `TaskServiceTests` (API) — end-to-end gRPC CRUD round-trip: create + get,
+  invalid id → `InvalidArgument`, not found → `NotFound`, list ordering
+  by `detected_at DESC`, status filter, `exported_at` auto-stamp on the
+  exported transition, double-delete idempotency.
 
-> **Windows-only.** `PreferencesStoreTests` exercises DPAPI; the project itself
-> is Windows-only so this is fine, but expect those tests to fail on Linux/macOS
-> CI.
+> **Windows-only desktop tests.** `PreferencesStoreTests` exercises DPAPI;
+> the desktop project itself is Windows-only so this is fine, but those
+> tests will fail on Linux/macOS CI. The API tests target net8.0 (no
+> WinForms dependency) and run anywhere Docker is available.
 
-Things deliberately *not* covered yet (because they need real models or live
-network and live in the "integration" category for a future test run):
+Things deliberately *not* covered yet:
 
-- End-to-end Whisper inference against a fixture WAV.
-- End-to-end Phi-3.5 prompting.
-- `HarvestClient` / `TrelloClient` / `SlackClient` — these are thin enough that
-  contract tests against a `WireMock`-style stub are higher-leverage than
-  unit-mocking them, but neither exists yet.
-
-## Live monitor window
-
-Tray → "Show live monitor…" (or `Ctrl+Shift+W`, or double-click the tray icon)
-opens an inspector window with two panes:
-
-- **FFT spectrum** — log-frequency bars from 80 Hz to ~7.8 kHz, peak-hold smoothed,
-  ~30 fps. Polls `WaveformRingBuffer` on a UI timer; no event coupling.
-- **Live log** — scrolling color-coded feed of every transcript and every detected
-  intent (with parameters). Self-trims to ~200 KB to stay snappy on long sessions.
-
-Closing the window only hides it; only the tray "Exit" item shuts the app down.
-
-## Settings & credentials
-
-Tray → "Settings…" (or `Ctrl+Shift+S`) opens a tabbed editor:
-
-- **Capture** — idle threshold, VAD activation/deactivation thresholds, hangover.
-- **Whisper** — model, language, initial prompt, translate, threads.
-- **Phi-3.5 LLM** — model variant, context size, threads, GPU offload, temperature.
-- **Harvest / Trello / Slack** — credentials + each tab has an inline "Test
-  connection" button that probes the live API and reports the connected identity.
-
-On Save, hot-reloadable preferences (capture thresholds, integration credentials)
-apply immediately — `IntegrationDispatcher.Reload(...)` swaps the underlying
-clients with a 5 s grace period for in-flight requests. Whisper / LLM model
-changes prompt for restart.
-
-Storage: `%LOCALAPPDATA%\WorkIntel\preferences.dat`. The outer JSON wrapper is
-plaintext (schema version + save timestamp) so you can confirm "what's stored"
-without DPAPI; the inner blob is encrypted with `ProtectedData.Protect` scoped
-to the current user with app-specific entropy. The blob is therefore
-non-portable: copy it to another machine or another user account and it won't
-decrypt.
-
-Legacy `config.json` (plaintext, pre-Phase-4) is migrated automatically on first
-launch and renamed to `config.json.migrated.bak`.
-
-Env-var overlay still works for headless / CI setups (any blank secret field is
-filled from `WORKINTEL_*` env vars at load time, but env values aren't persisted):
-
-| Field                            | Env var fallback                         |
-|----------------------------------|------------------------------------------|
-| `harvest.accountId`              | `WORKINTEL_HARVEST_ACCOUNT_ID`           |
-| `harvest.accessToken`            | `WORKINTEL_HARVEST_TOKEN`                |
-| `harvest.defaultProjectId`       | `WORKINTEL_HARVEST_DEFAULT_PROJECT_ID`   |
-| `harvest.defaultTaskId`          | `WORKINTEL_HARVEST_DEFAULT_TASK_ID`      |
-| `trello.apiKey`                  | `WORKINTEL_TRELLO_KEY`                   |
-| `trello.token`                   | `WORKINTEL_TRELLO_TOKEN`                 |
-| `trello.defaultListId`           | `WORKINTEL_TRELLO_DEFAULT_LIST`          |
-| `slack.botToken`                 | `WORKINTEL_SLACK_BOT_TOKEN`              |
-| `slack.defaultChannel`           | `WORKINTEL_SLACK_DEFAULT_CHANNEL`        |
-
-`IntegrationDispatcher` deduplicates intents within a 60 s sliding window using a
-SHA-1 hash of `kind + sorted(params)` so the same intent emitted across two
-adjacent Whisper segments doesn't double-fire.
+- End-to-end Whisper inference against a fixture WAV (needs the real model;
+  exercised manually via the replay path).
+- End-to-end Phi-3.5 prompting (same reason).
+- `IntegrationDispatcher` legacy paths — vestigial code, pending removal.
 
 ## Roadmap
 
-We're currently in the engineering loop: **prototype → test → refactor → release.**
-
-1. ~~**Phase 1 — Audio capture + tray scaffold**~~ done.
-2. ~~**Phase 2 — Whisper.net sink**~~ done.
-3. ~~**Phase 3 — Local intent extraction (Phi-3.5)**~~ done.
-4. ~~**Phase 4 — Integration dispatchers (Harvest / Trello / Slack)**~~ done.
-5. ~~**Phase 5 — Settings UI + DPAPI secret storage**~~ done.
-6. ~~**Phase 6 — Unit tests (current)**~~ done. xUnit harness covering the
-   pure-logic units; integration / model-loading tests deferred.
-7. **Phase 7 — Refactor pass.** Three refactors done:
-   - `LazyNativeModel` extracted as a shared base for `WhisperTranscriber` and
-     `LocalIntentExtractor`. Lifecycle (init lock, process lock, init-failed
-     flag, drain-on-dispose) now lives in one tested place; subclasses only
-     declare `LoadCoreAsync` / `ReleaseResourcesAsync` and the inference body.
-   - `BaseHttpClient` extracted as a shared base for `HarvestClient`,
-     `TrelloClient`, `SlackClient`. Owns the `HttpClient` lifetime, send +
-     non-2xx logging + body truncation, and JSON GET/POST helpers. Each
-     subclass shrank to ~60 lines of just-the-domain logic.
-   - `TranscriptLog` extracted from `MainWindow`. Owns the `RichTextBox`,
-     color palette, formatting policy, trim-on-overflow, and internal UI-thread
-     marshalling. `MainWindow` is now strictly a layout shell + event
-     translator. Adding a new visible event kind (e.g. dispatch outcome)
-     becomes one method on the log + one subscription on the form.
-8. **Phase 8 — Release prep.** Single-file publish, code-signed exe, Inno Setup
-   installer, version metadata in the About dialog, telemetry-free crash dumps.
-9. **Backlog (post-release):**
-   - **Better VAD** — Silero VAD (ONNX runtime) in place of the energy detector.
-   - **Trello list-name resolution** — board-list cache so the LLM can target
-     a list by name instead of an ID.
-   - **Dispatcher → UI feedback** — surface dispatch outcome next to each intent
-     line in the live monitor.
-   - **Persist idempotency cache across restarts** — currently in-memory only.
-   - **Smoke-test harness** — replay a fixture WAV through the full pipeline
-     for offline regression testing of the model-touching paths.
-   - **Pluggable inference backend** — `IUnifiedAudioBackend` abstraction so a
-     containerized audio LLM (MOSS-Audio, Voxtral, Qwen-Audio) can opt in
-     alongside the local Whisper + Phi-3.5 default.
+1. ✅ **Phase 1 — Audio capture + tray scaffold.**
+2. ✅ **Phase 2 — Whisper transcription.**
+3. ✅ **Phase 3 — Local LLM extraction (Phi-3.5).**
+4. ✅ **Phase 4 — Settings UI + DPAPI secret storage.**
+5. ✅ **Phase 5 — Live monitor window (FFT + transcript log).**
+6. ✅ **Phase 6 — Unit tests + refactor pass.** `LazyNativeModel`,
+   `BaseHttpClient`, and `TranscriptLog` extracted; 77 tests green.
+7. ✅ **Phase 7 — Containerized backend.** Postgres + ASP.NET Core gRPC
+   service, EF Core schema, Testcontainers-driven integration tests.
+8. **Phase 8 — Desktop ↔ backend wire-up (next).** Generated gRPC client
+   referenced from the desktop, `RemoteTaskStore` replacing the dispatcher
+   hop, new Tasks tab in the live monitor populated by `ListTasks` +
+   `StreamTaskEvents`. Reframe the LLM prompt from intent-style to
+   task-candidate-style as part of this.
+9. **Phase 9 — Slack DM listener.** SlackNet over Socket Mode, user-scope
+   `im:history`, subscribed to `message.im`. Each incoming DM goes through
+   the same task-extraction prompt and lands in the same task store.
+10. **Phase 10 — Triage UI.** Tasks tab with sortable list, status filters
+    (Pending / Included / Excluded / Exported), Include / Exclude / Remove
+    actions.
+11. **Phase 11 — Email export.** SMTP config + named destinations
+    (Trello-board email, Jira-project email). Included tasks get sent
+    with subject = title, body = original context + extracted summary;
+    status flips to `exported` with the destination recorded.
+12. **Phase 12 — Release prep.** Single-file publish, code-signed exe,
+    Inno Setup installer, version metadata in the About dialog,
+    telemetry-free crash dumps.
+13. **Backlog (post-release):**
+    - **Silero VAD** (ONNX runtime) in place of the energy detector.
+    - **REST surface via gRPC-JSON transcoding** for `curl`-friendly debugging.
+    - **EF Core migrations** in place of `EnsureCreatedAsync`.
+    - **Bearer-token auth** on the API (gates any remote deployment).
+    - **Multi-user** — schema already has `user_id`; needs auth + UI scoping.
 
 ## Privacy posture
 
-| Component              | Network calls                                                        |
-|------------------------|----------------------------------------------------------------------|
-| WASAPI capture         | None                                                                 |
-| Whisper transcription  | None at runtime (one-time HF download of public weights on first use)|
-| Phi-3.5 intent extract | None at runtime (one-time HF download of public weights on first use)|
-| Harvest / Trello / Slack dispatch | Only to the user-configured integration endpoints, only on a detected intent (Phase 3) |
+| Component                   | Network calls                                                              |
+|-----------------------------|----------------------------------------------------------------------------|
+| WASAPI loopback capture     | None.                                                                      |
+| Whisper transcription       | None at runtime. One-time HF download of public weights on first use.      |
+| Phi-3.5 extraction          | None at runtime. One-time HF download of public weights on first use.      |
+| Desktop ↔ API (gRPC)        | Local loopback only (localhost:5000) until a remote-deploy phase.          |
+| Slack DM listener (planned) | Persistent WebSocket to slack.com for `message.im` events.                 |
+| Email export (planned)      | SMTP to your configured email account, sending to board-ingest addresses.  |
 
-Audio bytes, transcripts, and detected intents never leave WorkIntel except as
-explicit, user-authorized API calls to the user's own Harvest / Trello / Slack
-workspace.
+Audio bytes, transcripts, and LLM output stay on the device. The only
+runtime outbound traffic, once Phase 9 and 11 land, is the Slack event
+stream and the email export — both to endpoints you configure.
 
 ## License
 
