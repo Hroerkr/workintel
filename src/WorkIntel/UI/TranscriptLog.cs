@@ -5,6 +5,7 @@ using System.Threading;
 using System.Windows.Forms;
 using WorkIntel.App;
 using WorkIntel.Pipeline;
+using WorkIntel.Tasks;
 
 namespace WorkIntel.UI;
 
@@ -95,22 +96,32 @@ public sealed class TranscriptLog : UserControl
 
     public void AppendIntent(DetectedIntent intent)
     {
+        // Vestigial — kept compilable for the dispatcher path, not called on the new pipeline.
         Post(() =>
         {
             WriteInline("   → ", AccentIntent);
             WriteInline(intent.Kind, AccentIntent, bold: true);
             WriteInline($"  (conf {intent.Confidence:F2})", MutedColor);
-            if (intent.Parameters.Count > 0)
+            EndLine();
+        });
+    }
+
+    public void AppendTask(TaskCandidate task)
+    {
+        Post(() =>
+        {
+            WriteInline("   → ", AccentIntent);
+            WriteInline(task.Title, AccentIntent, bold: true);
+            WriteInline($"  (conf {task.Confidence:F2})", MutedColor);
+            if (!string.IsNullOrWhiteSpace(task.Owner))
             {
-                WriteInline("  ", FgColor);
-                bool first = true;
-                foreach (var kv in intent.Parameters)
-                {
-                    if (!first) WriteInline(", ", MutedColor);
-                    WriteInline($"{kv.Key}=", MutedColor);
-                    WriteInline(kv.Value ?? "(null)", FgColor);
-                    first = false;
-                }
+                WriteInline("  owner=", MutedColor);
+                WriteInline(task.Owner, FgColor);
+            }
+            if (!string.IsNullOrWhiteSpace(task.Deadline))
+            {
+                WriteInline("  deadline=", MutedColor);
+                WriteInline(task.Deadline, FgColor);
             }
             EndLine();
         });

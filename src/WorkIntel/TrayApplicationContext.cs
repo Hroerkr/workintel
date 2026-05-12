@@ -25,7 +25,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly StateManager _state;
     private readonly AudioCaptureService _capture;
     private readonly EnergyVad _vad;
-    private readonly IntegrationDispatcher _dispatcher;
+    // Dispatcher is vestigial — kept nullable so Program.cs can pass null while
+    // the legacy Settings flow still touches it for the integration tabs.
+    private readonly IntegrationDispatcher? _dispatcher;
     private readonly Func<MainWindow> _mainWindowFactory;
     private readonly NotifyIcon _notifyIcon;
     private readonly IReadOnlyDictionary<AppState, Icon> _icons;
@@ -43,7 +45,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         StateManager state,
         AudioCaptureService capture,
         EnergyVad vad,
-        IntegrationDispatcher dispatcher,
+        IntegrationDispatcher? dispatcher,
         AppPreferences currentPrefs,
         Func<MainWindow> mainWindowFactory)
     {
@@ -175,7 +177,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _vad.ActivationDb   = p.Capture.VadActivationDb;
             _vad.DeactivationDb = p.Capture.VadDeactivationDb;
             _vad.Hangover       = TimeSpan.FromMilliseconds(p.Capture.VadHangoverMs);
-            _dispatcher.Reload(p.Secrets);
+            _dispatcher?.Reload(p.Secrets);
             Log.Info("hot-reloadable preferences applied (capture thresholds, integration credentials)");
         }
         catch (Exception ex)

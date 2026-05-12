@@ -30,7 +30,8 @@ services:
       ASPNETCORE_ENVIRONMENT: Production
       ConnectionStrings__Default: "Host=postgres;Port=5432;Database=workintel;Username=workintel;Password=workintel"
     ports:
-      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:5000:5000"   # gRPC (HTTP/2 cleartext)
+      - "127.0.0.1:5001:5001"   # REST (HTTP/1.1) — /, /health, debug
     depends_on:
       postgres:
         condition: service_healthy

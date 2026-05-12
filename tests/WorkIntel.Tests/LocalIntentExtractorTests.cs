@@ -1,12 +1,11 @@
-using System.Linq;
 using WorkIntel.Intent;
 using Xunit;
 
 namespace WorkIntel.Tests;
 
 /// <summary>
-/// Exercises <see cref="LocalIntentExtractor.ParseIntents"/> only. The full extractor
-/// requires a multi-GB model load and is exercised manually / in integration tests.
+/// Exercises <see cref="LocalIntentExtractor.ParseTasks"/> only. The full
+/// extractor requires a multi-GB model load and is exercised manually.
 /// </summary>
 public sealed class LocalIntentExtractorTests
 {
@@ -14,17 +13,31 @@ public sealed class LocalIntentExtractorTests
     public void WellFormedJson_ParsesCleanly()
     {
         const string raw = """
-            [{"kind":"harvest.clock_in","parameters":{"task":"Acme refactor"},"confidence":0.91,"source_quote":"start a timer"}]
+            [{"title":"Fix export bug","owner":"me","deadline":"today","confidence":0.92,"source_quote":"fix the export bug today"}]
             """;
 
-        var intents = LocalIntentExtractor.ParseIntents(raw);
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
 
-        Assert.Single(intents);
-        var i = intents[0];
-        Assert.Equal(IntentSchema.HarvestClockIn, i.Kind);
-        Assert.Equal("Acme refactor", i.Parameters["task"]);
-        Assert.Equal(0.91, i.Confidence, 2);
-        Assert.Equal("start a timer", i.SourceQuote);
+        Assert.Single(tasks);
+        var t = tasks[0];
+        Assert.Equal("Fix export bug", t.Title);
+        Assert.Equal("me", t.Owner);
+        Assert.Equal("today", t.Deadline);
+        Assert.Equal(0.92, t.Confidence, 2);
+        Assert.Equal("fix the export bug today", t.SourceQuote);
+    }
+
+    [Fact]
+    public void OptionalFieldsAbsent_StillParses()
+    {
+        const string raw = """[{"title":"Update runbook","confidence":0.8,"source_quote":"update the runbook"}]""";
+
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
+
+        Assert.Single(tasks);
+        Assert.Null(tasks[0].Description);
+        Assert.Null(tasks[0].Owner);
+        Assert.Null(tasks[0].Deadline);
     }
 
     [Fact]
@@ -32,15 +45,14 @@ public sealed class LocalIntentExtractorTests
     {
         const string raw = """
             ```json
-            [{"kind":"slack.post_message","parameters":{"channel":"#eng","text":"green"},"confidence":0.8,"source_quote":"slack"}]
+            [{"title":"Write up notes","confidence":0.7,"source_quote":"write up the notes"}]
             ```
             """;
 
-        var intents = LocalIntentExtractor.ParseIntents(raw);
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
 
-        Assert.Single(intents);
-        Assert.Equal(IntentSchema.SlackPostMessage, intents[0].Kind);
-        Assert.Equal("#eng", intents[0].Parameters["channel"]);
+        Assert.Single(tasks);
+        Assert.Equal("Write up notes", tasks[0].Title);
     }
 
     [Fact]
@@ -48,87 +60,85 @@ public sealed class LocalIntentExtractorTests
     {
         const string raw = """
             Sure! Here's the JSON:
-            [{"kind":"trello.create_card","parameters":{"title":"Fix"},"confidence":0.9,"source_quote":"create"}]
+            [{"title":"Review PR","confidence":0.85,"source_quote":"review the PR"}]
             Hope that helps.
             """;
 
-        var intents = LocalIntentExtractor.ParseIntents(raw);
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
 
-        Assert.Single(intents);
-        Assert.Equal(IntentSchema.TrelloCreateCard, intents[0].Kind);
+        Assert.Single(tasks);
+        Assert.Equal("Review PR", tasks[0].Title);
     }
 
     [Fact]
-    public void NoneIntents_AreFilteredOut()
+    public void EmptyArray_ProducesNoTasks()
     {
-        const string raw = """
-            [{"kind":"none","parameters":{},"confidence":0.1,"source_quote":""}]
-            """;
-
-        var intents = LocalIntentExtractor.ParseIntents(raw);
-
-        Assert.Empty(intents);
+        Assert.Empty(LocalIntentExtractor.ParseTasks("[]"));
     }
 
     [Fact]
-    public void EmptyArray_ProducesNoIntents()
+    public void EmptyOrWhitespaceInput_ProducesNoTasks()
     {
-        var intents = LocalIntentExtractor.ParseIntents("[]");
-        Assert.Empty(intents);
+        Assert.Empty(LocalIntentExtractor.ParseTasks(""));
+        Assert.Empty(LocalIntentExtractor.ParseTasks("   "));
     }
 
     [Fact]
-    public void EmptyOrWhitespaceInput_ProducesNoIntents()
+    public void NonsenseInput_ProducesNoTasks()
     {
-        Assert.Empty(LocalIntentExtractor.ParseIntents(""));
-        Assert.Empty(LocalIntentExtractor.ParseIntents("   "));
-    }
-
-    [Fact]
-    public void NonsenseInput_ProducesNoIntents()
-    {
-        Assert.Empty(LocalIntentExtractor.ParseIntents("the model decided to refuse"));
+        Assert.Empty(LocalIntentExtractor.ParseTasks("the model decided to refuse"));
     }
 
     [Fact]
     public void MalformedJsonAfterStart_DoesNotThrow()
     {
-        const string raw = "[{\"kind\":\"harvest.clock_in\", broken";
-
-        var intents = LocalIntentExtractor.ParseIntents(raw);
-
-        Assert.Empty(intents); // graceful, not exceptional
+        const string raw = "[{\"title\":\"Fix bug\", broken";
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
+        Assert.Empty(tasks);
     }
 
     [Fact]
-    public void MultipleIntents_AreAllReturned()
+    public void EntriesWithBlankTitle_AreFilteredOut()
+    {
+        const string raw = """
+            [{"title":"","confidence":0.1,"source_quote":""},
+             {"title":"   ","confidence":0.1,"source_quote":""},
+             {"title":"Real task","confidence":0.9,"source_quote":"x"}]
+            """;
+
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
+
+        Assert.Single(tasks);
+        Assert.Equal("Real task", tasks[0].Title);
+    }
+
+    [Fact]
+    public void MultipleTasks_AreAllReturned()
     {
         const string raw = """
             [
-              {"kind":"harvest.clock_in","parameters":{"task":"a"},"confidence":0.9,"source_quote":"x"},
-              {"kind":"trello.create_card","parameters":{"title":"b"},"confidence":0.8,"source_quote":"y"}
+              {"title":"Task A","confidence":0.9,"source_quote":"a"},
+              {"title":"Task B","confidence":0.8,"source_quote":"b"}
             ]
             """;
 
-        var intents = LocalIntentExtractor.ParseIntents(raw);
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
 
-        Assert.Equal(2, intents.Count);
-        Assert.Equal(IntentSchema.HarvestClockIn, intents[0].Kind);
-        Assert.Equal(IntentSchema.TrelloCreateCard, intents[1].Kind);
+        Assert.Equal(2, tasks.Count);
+        Assert.Equal("Task A", tasks[0].Title);
+        Assert.Equal("Task B", tasks[1].Title);
     }
 
     [Fact]
     public void StringContainingBracket_DoesNotConfuseDepthCounter()
     {
-        // The closing bracket inside the quoted string must not be counted as
-        // closing the outer array.
         const string raw = """
-            [{"kind":"slack.post_message","parameters":{"channel":"#x","text":"see [link]"},"confidence":0.7,"source_quote":"q"}]
+            [{"title":"Investigate [link] in email","confidence":0.7,"source_quote":"see [link]"}]
             """;
 
-        var intents = LocalIntentExtractor.ParseIntents(raw);
+        var tasks = LocalIntentExtractor.ParseTasks(raw);
 
-        Assert.Single(intents);
-        Assert.Equal("see [link]", intents[0].Parameters["text"]);
+        Assert.Single(tasks);
+        Assert.Contains("[link]", tasks[0].Title);
     }
 }

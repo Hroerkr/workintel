@@ -1,13 +1,13 @@
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace WorkIntel.Pipeline;
 
 /// <summary>
-/// Phase 4 plug-point: dispatch a <see cref="DetectedIntent"/> to the right
-/// integration (Harvest v2, Trello, Slack Web API). Implementations should be
-/// idempotent where possible — Claude will occasionally double-emit intents and
-/// we never want to log a task twice.
+/// Vestigial outbound dispatcher interface from the pre-pivot design. Kept
+/// alongside its implementations under <c>Integrations/</c> so the old code
+/// still compiles, but no longer wired into the live pipeline.
 /// </summary>
 public interface IIntegrationDispatcher
 {
@@ -17,4 +17,14 @@ public interface IIntegrationDispatcher
 public sealed record DispatchResult(
     bool Success,
     string? Message,
-    string? RemoteUrl);   // e.g. Trello card URL or Slack permalink, when available
+    string? RemoteUrl);
+
+/// <summary>
+/// Old intent shape (kind + parameters). Retained for the dispatcher code; new
+/// task-extraction path emits <see cref="WorkIntel.Tasks.TaskCandidate"/>.
+/// </summary>
+public sealed record DetectedIntent(
+    string Kind,
+    IReadOnlyDictionary<string, string?> Parameters,
+    double Confidence,
+    string SourceQuote);

@@ -1,99 +1,97 @@
 namespace WorkIntel.Intent;
 
 /// <summary>
-/// Well-known intent kinds and the system prompt that teaches the local LLM
-/// how to emit them.
+/// System prompt + JSON schema for the local LLM. The model reads a single
+/// signal (a transcript, an email, a Slack message) and emits a JSON array of
+/// task candidates — things the user would treat as actionable.
 /// </summary>
 /// <remarks>
 /// <para>
-/// During the Slack-focus phase, only <see cref="SlackPostMessage"/> is in the
-/// active prompt. Harvest and Trello constants are retained so their dispatcher
-/// handlers and test surface stay compilable; the LLM just won't be prompted
-/// to emit them. Re-enable by adding back their examples to <see cref="SystemPrompt"/>.
+/// Source-agnostic by design. The signal-emitter tags the row with where it
+/// came from after the fact; the LLM doesn't need to know whether it's reading
+/// a transcript or an inbox. Source-specific prompt tuning can come later if
+/// quality differs meaningfully per channel.
 /// </para>
 /// <para>
-/// Keep the kind strings stable: <see cref="WorkIntel.Pipeline.IIntegrationDispatcher"/>
-/// dispatches by exact match.
+/// Negative examples carry most of the conservatism — first iteration with
+/// real YouTube audio will produce false positives, and the cheapest fix is
+/// adding the offending snippet as a new negative example here.
 /// </para>
 /// </remarks>
 public static class IntentSchema
 {
+    // Kept for the (currently vestigial) dispatcher code to still compile.
+    // Safe to delete once Integrations/ is removed.
     public const string HarvestClockIn   = "harvest.clock_in";
     public const string HarvestClockOut  = "harvest.clock_out";
     public const string TrelloCreateCard = "trello.create_card";
     public const string SlackPostMessage = "slack.post_message";
     public const string NoIntent         = "none";
 
-    /// <summary>
-    /// System prompt fed to the local LLM. Slack-focused for the current
-    /// debug iteration: Harvest / Trello are deliberately omitted so the
-    /// model doesn't extract intents we can't usefully dispatch yet.
-    /// </summary>
-    /// <remarks>
-    /// Slack's <c>chat.postMessage</c> endpoint accepts a channel name with
-    /// or without the <c>#</c> prefix, or a channel ID (<c>C0123456</c>).
-    /// We let the model emit whatever the speaker said and pass it through
-    /// unmodified — Slack handles the resolution.
-    /// </remarks>
     public const string SystemPrompt = """
-        You extract Slack messaging intents from a transcript of the user's spoken activity.
+        You read short snippets of communication (a spoken transcript, an email, a chat message)
+        and extract action items the listener/reader would treat as a task to do.
 
-        Output ONLY a JSON array. No commentary, no markdown fences. If the transcript contains nothing actionable, output [].
+        Output ONLY a JSON array. No commentary, no markdown fences. If the snippet contains
+        nothing actionable, output [].
 
-        Each intent has shape:
-          {"kind": "...", "parameters": {...}, "confidence": 0.0-1.0, "source_quote": "..."}
+        Each task has shape:
+          {
+            "title": string,            // short imperative summary, e.g. "Fix export bug"
+            "description": string?,     // additional detail, when the snippet gives more context
+            "owner": string?,           // "me" | sender's name | named person, when clearly implied
+            "deadline": string?,        // natural-language or ISO date, when explicitly mentioned
+            "confidence": 0.0-1.0,
+            "source_quote": string      // verbatim snippet that justifies this task
+          }
 
-        Available intent kind:
-          - slack.post_message   params: {"channel": string, "text": string}
+        What counts as a task:
+          - A request to do something ("Can you …", "Please …", "I need …")
+          - A commitment from the user ("I'll handle …", "I'll have it ready by …")
+          - An explicit follow-up agreed in conversation ("Let's circle back on X tomorrow")
 
-        Channel field rules:
-          - Accept channel names with hash: "#general"
-          - Accept channel names without hash: "engineering"
-          - Accept channel IDs: "C0123456" (uncommon in speech)
-          - Pass through the user's wording — do not add or remove the hash.
-
-        Text field rules:
-          - The text is what the user wants posted, NOT how they phrased the request.
-            "Tell #eng that I'll be late" → text: "I'll be late" (NOT "Tell #eng that I'll be late")
-          - Capitalize naturally; the LLM should clean up filler words like "uh", "um".
-          - Keep names and technical terms verbatim.
+        What does NOT count as a task:
+          - Status updates and information sharing ("The deploy went out at 3am")
+          - Opinions, reactions, social pleasantries ("Great work today", "Good morning")
+          - Speculation, hypotheticals ("We could maybe look at X", "It might be worth …")
+          - Generic mentions of work without an actionable ask ("The Q3 numbers were up")
+          - Anything the user is only listening to passively (a podcast, a video, a meeting recap)
 
         Rules:
-          - Be conservative. Emit ONLY when the user gives both a destination (channel) AND a message.
-          - source_quote MUST be a verbatim snippet from the transcript that justifies the intent.
-          - Casual mentions of Slack ("I'll Slack them later", "we should probably let the team know") are NOT intents.
-          - When in doubt, output [].
+          - Be conservative. When in doubt, output [].
+          - source_quote MUST be verbatim from the input.
+          - "I'll handle X" → owner: "me".
+          - "Can you handle X?" addressed to the user → owner: "me".
+          - "Bob is handling X" → not a task on the user. Output [].
+          - Re-phrase the title in clean imperative form even if the source is verbose.
 
         Examples:
 
-        Transcript: Slack the team in #eng-build that the green pipeline is restored.
-        Output: [{"kind":"slack.post_message","parameters":{"channel":"#eng-build","text":"The green pipeline is restored"},"confidence":0.92,"source_quote":"Slack the team in #eng-build that the green pipeline is restored"}]
+        Input: "Hey, can you take a look at the export bug today? It's blocking the team."
+        Output: [{"title":"Look at the export bug","description":"Blocking the team","owner":"me","deadline":"today","confidence":0.92,"source_quote":"can you take a look at the export bug today"}]
 
-        Transcript: Post to engineering: meeting moved to three pm.
-        Output: [{"kind":"slack.post_message","parameters":{"channel":"engineering","text":"Meeting moved to 3pm"},"confidence":0.93,"source_quote":"Post to engineering: meeting moved to three pm"}]
+        Input: "I'll have the design review notes written up by Friday."
+        Output: [{"title":"Write up design review notes","owner":"me","deadline":"Friday","confidence":0.9,"source_quote":"I'll have the design review notes written up by Friday"}]
 
-        Transcript: Send a message to the random channel saying happy birthday Sarah.
-        Output: [{"kind":"slack.post_message","parameters":{"channel":"random","text":"Happy birthday Sarah"},"confidence":0.9,"source_quote":"Send a message to the random channel saying happy birthday Sarah"}]
-
-        Transcript: Tell the team in #general I'll be late by about ten minutes.
-        Output: [{"kind":"slack.post_message","parameters":{"channel":"#general","text":"I'll be late by about 10 minutes"},"confidence":0.9,"source_quote":"Tell the team in #general I'll be late by about ten minutes"}]
-
-        Transcript: Slack #devops: deploy is rolling now.
-        Output: [{"kind":"slack.post_message","parameters":{"channel":"#devops","text":"Deploy is rolling now"},"confidence":0.93,"source_quote":"Slack #devops: deploy is rolling now"}]
-
-        Transcript: I'll Slack them later about the meeting.
+        Input: "The deploy went out at 3am and the metrics look fine."
         Output: []
 
-        Transcript: We should probably let the team know.
+        Input: "Good morning everyone, hope you had a great weekend."
         Output: []
 
-        Transcript: Good morning everyone.
+        Input: "We could maybe revisit the caching strategy at some point."
         Output: []
 
-        Transcript: Let me start a timer for this work.
+        Input: "Please update the runbook to mention the new fail-over procedure."
+        Output: [{"title":"Update runbook with new fail-over procedure","owner":"me","confidence":0.88,"source_quote":"Please update the runbook to mention the new fail-over procedure"}]
+
+        Input: "Bob is handling the migration to the new auth service."
         Output: []
 
-        Transcript: I think we should ship by Friday.
+        Input: "Let's circle back on the API design next Tuesday."
+        Output: [{"title":"Follow up on API design","deadline":"next Tuesday","confidence":0.7,"source_quote":"Let's circle back on the API design next Tuesday"}]
+
+        Input: "I love the new dashboard, it's so much cleaner."
         Output: []
         """;
 }

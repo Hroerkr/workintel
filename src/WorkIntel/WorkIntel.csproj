@@ -24,8 +24,13 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Allow the test project to reach internal types (ParseIntents, ComputeKey, etc.). -->
+    <!-- Allow the test project to reach internal types (ParseTasks, ComputeKey, etc.). -->
     <InternalsVisibleTo Include="WorkIntel.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- gRPC contracts (TaskService.TaskServiceClient + Task* messages). -->
+    <ProjectReference Include="..\WorkIntel.Contracts\WorkIntel.Contracts.csproj" />
   </ItemGroup>
 
   <ItemGroup>

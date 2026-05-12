@@ -5,8 +5,8 @@ using System.Windows.Forms;
 using WorkIntel.App;
 using WorkIntel.Audio;
 using WorkIntel.Configuration;
-using WorkIntel.Integrations;
 using WorkIntel.Intent;
+using WorkIntel.Tasks;
 using WorkIntel.Transcription;
 using WorkIntel.UI;
 
@@ -14,15 +14,22 @@ namespace WorkIntel;
 
 internal static class Program
 {
+    // Phase-1 backend address. Move to AppPreferences.Backend once we wire the Settings tab.
+    private const string DefaultBackendEndpoint = "http://localhost:5000";
+
     /// <summary>
-    /// Composition root. Loads encrypted preferences, builds the audio /
-    /// transcription / intent / dispatcher chain from them, hands hot-reloadable
-    /// references (StateManager, EnergyVad, IntegrationDispatcher) to the tray
-    /// context so the Settings dialog can reapply changes without restart.
+    /// Composition root. Loads encrypted preferences, builds the audio →
+    /// transcription → task-extraction → remote task store chain, hands
+    /// hot-reloadable references to the tray.
     /// </summary>
     [STAThread]
     private static void Main()
     {
+        // gRPC over cleartext HTTP/2 needs this AppContext switch BEFORE any
+        // channel is constructed. Localhost-only for Phase 1; once we ship TLS
+        // we can drop the flag.
+        AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+
         using var mutex = new Mutex(initiallyOwned: true, name: "WorkIntel.SingleInstance", out bool createdNew);
         if (!createdNew)
         {
@@ -59,39 +66,33 @@ internal static class Program
             Hangover       = TimeSpan.FromMilliseconds(prefs.Capture.VadHangoverMs),
         };
 
-        // Whisper: local STT (no data leaves the machine).
+        // Whisper: local STT.
         var whisperStore = new WhisperModelStore(prefs.Whisper.ModelDirectory);
         var transcriber = new WhisperTranscriber(prefs.Whisper, whisperStore);
 
-        // Phi-3.5: local intent extraction (no data leaves the machine).
+        // Phi-3.5: local task extraction.
         var llmStore = new LocalLlmModelStore(prefs.Llm.ModelDirectory);
         var intentExtractor = new LocalIntentExtractor(prefs.Llm, llmStore);
 
-        // Integration dispatcher: outbound calls only to user-configured workspaces.
-        var dispatcher = new IntegrationDispatcher(
-            new HarvestClient(prefs.Secrets.Harvest ?? new HarvestSecrets()),
-            new TrelloClient(prefs.Secrets.Trello ?? new TrelloSecrets()),
-            new SlackClient(prefs.Secrets.Slack ?? new SlackSecrets()));
+        // Remote task store: gRPC client + background event subscription.
+        var taskStore = new RemoteTaskStore(DefaultBackendEndpoint);
 
-        // Sink: transcribe → extract intents → dispatch.
         var audioSink = new TranscribingAudioSink(
             transcriber: transcriber,
-            intentExtractor: intentExtractor,
-            dispatcher: dispatcher);
+            extractor: intentExtractor,
+            taskStore: taskStore);
 
         var captureService = new AudioCaptureService(stateManager, audioSink, vad);
 
-        // Tray context owns the window factory and the hot-reload handles.
         using var trayContext = new TrayApplicationContext(
             stateManager,
             captureService,
             vad,
-            dispatcher,
+            dispatcher: null,  // legacy outbound dispatcher path no longer wired
             prefs,
-            mainWindowFactory: () => new MainWindow(captureService.Waveform, audioSink, stateManager));
+            mainWindowFactory: () => new MainWindow(captureService.Waveform, audioSink, stateManager, taskStore));
 
-        // Warm up both models in parallel on background threads. Capture starts immediately;
-        // segments queue at the respective process locks until each model is ready.
+        // Warm up both models on background threads. Capture starts immediately.
         _ = Task.Run(async () =>
         {
             try { await transcriber.WarmupAsync().ConfigureAwait(false); }
@@ -102,6 +103,10 @@ internal static class Program
             try { await intentExtractor.WarmupAsync().ConfigureAwait(false); }
             catch (Exception ex) { Log.Error("local LLM warmup failed", ex); }
         });
+
+        // Start the gRPC event subscription early — even before the main window
+        // opens, the TaskListPanel will already have live data when shown.
+        taskStore.StartEventStream();
 
         try
         {
@@ -123,7 +128,7 @@ internal static class Program
         captureService.Dispose();
         transcriber.DisposeAsync().AsTask().GetAwaiter().GetResult();
         intentExtractor.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        dispatcher.Dispose();
+        taskStore.DisposeAsync().AsTask().GetAwaiter().GetResult();
         stateManager.Dispose();
     }
 }

@@ -10,14 +10,15 @@ using LLama.Common;
 using LLama.Sampling;
 using WorkIntel.App;
 using WorkIntel.Pipeline;
+using WorkIntel.Tasks;
 using WorkIntel.Transcription; // DownloadProgress
 
 namespace WorkIntel.Intent;
 
 /// <summary>
 /// <see cref="IIntentExtractor"/> backed by LLamaSharp + a local gguf model
-/// (Phi-3.5 Mini Instruct by default). Lifecycle (lazy load, serialized inference,
-/// drain-on-dispose) is inherited from <see cref="LazyNativeModel"/>.
+/// (Phi-3.5 Mini Instruct by default). Returns task candidates extracted from
+/// the supplied transcript.
 /// </summary>
 public sealed class LocalIntentExtractor : LazyNativeModel, IIntentExtractor
 {
@@ -40,18 +41,18 @@ public sealed class LocalIntentExtractor : LazyNativeModel, IIntentExtractor
         _store = store;
     }
 
-    public async Task<IReadOnlyList<DetectedIntent>> ExtractAsync(TranscriptionResult transcription, CancellationToken ct)
+    public async Task<IReadOnlyList<TaskCandidate>> ExtractAsync(TranscriptionResult transcription, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(transcription.Text)) return Array.Empty<DetectedIntent>();
-        if (transcription.Text.Length < _options.MinTranscriptChars) return Array.Empty<DetectedIntent>();
+        if (string.IsNullOrWhiteSpace(transcription.Text)) return Array.Empty<TaskCandidate>();
+        if (transcription.Text.Length < _options.MinTranscriptChars) return Array.Empty<TaskCandidate>();
 
         if (!await EnsureInitializedAsync(ct).ConfigureAwait(false))
-            return Array.Empty<DetectedIntent>();
+            return Array.Empty<TaskCandidate>();
 
         return await RunSerializedAsync(innerCt => InferAsync(transcription, innerCt), ct).ConfigureAwait(false);
     }
 
-    private async Task<IReadOnlyList<DetectedIntent>> InferAsync(TranscriptionResult transcription, CancellationToken ct)
+    private async Task<IReadOnlyList<TaskCandidate>> InferAsync(TranscriptionResult transcription, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var executor = new StatelessExecutor(_weights!, _modelParams!);
@@ -71,14 +72,14 @@ public sealed class LocalIntentExtractor : LazyNativeModel, IIntentExtractor
             if (sb.Length > 8 * 1024) break; // safety valve against runaway output
         }
 
-        var intents = ParseIntents(sb.ToString());
+        var tasks = ParseTasks(sb.ToString());
         sw.Stop();
 
-        Log.Info($"intent extraction: {intents.Count} in {sw.Elapsed.TotalSeconds:F2}s for transcript of {transcription.Text.Length} chars");
-        foreach (var i in intents)
-            Log.Debug($"  → {i.Kind} ({i.Confidence:F2}): {Truncate(i.SourceQuote, 80)}");
+        Log.Info($"task extraction: {tasks.Count} in {sw.Elapsed.TotalSeconds:F2}s for transcript of {transcription.Text.Length} chars");
+        foreach (var t in tasks)
+            Log.Debug($"  → \"{Truncate(t.Title, 80)}\" (conf {t.Confidence:F2})");
 
-        return intents;
+        return tasks;
     }
 
     protected override async Task LoadCoreAsync(CancellationToken ct)
@@ -106,27 +107,25 @@ public sealed class LocalIntentExtractor : LazyNativeModel, IIntentExtractor
         return ValueTask.CompletedTask;
     }
 
-    /// <summary>
-    /// Phi-3.5 instruct chat template. Must match the format the model was
-    /// fine-tuned on — wrong template = garbage output.
-    /// </summary>
-    private static string BuildPhi35Prompt(string transcript) =>
+    /// <summary>Phi-3.5 instruct chat template — must match the format the model was
+    /// fine-tuned on or output is garbage.</summary>
+    private static string BuildPhi35Prompt(string content) =>
         $"<|system|>\n{IntentSchema.SystemPrompt}<|end|>\n" +
-        $"<|user|>\nTranscript: {transcript}\nOutput:<|end|>\n" +
+        $"<|user|>\nInput: {content}\nOutput:<|end|>\n" +
         $"<|assistant|>\n";
 
     /// <summary>
-    /// Robust JSON-array extraction. Phi-3.5 occasionally wraps output in code
+    /// Robust JSON-array extraction. Phi-3.5 sometimes wraps output in code
     /// fences or trails extra commentary; we find the first top-level <c>[</c>,
-    /// scan forward respecting bracket depth + string state, and parse that slice.
+    /// scan forward respecting bracket depth + string state, parse that slice.
     /// Internal so unit tests can drive it directly.
     /// </summary>
-    internal static IReadOnlyList<DetectedIntent> ParseIntents(string raw)
+    internal static IReadOnlyList<TaskCandidate> ParseTasks(string raw)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return Array.Empty<DetectedIntent>();
+        if (string.IsNullOrWhiteSpace(raw)) return Array.Empty<TaskCandidate>();
 
         int start = raw.IndexOf('[');
-        if (start < 0) return Array.Empty<DetectedIntent>();
+        if (start < 0) return Array.Empty<TaskCandidate>();
 
         int depth = 0;
         bool inString = false;
@@ -148,46 +147,46 @@ public sealed class LocalIntentExtractor : LazyNativeModel, IIntentExtractor
             }
         }
 
-        if (end < 0) return Array.Empty<DetectedIntent>();
+        if (end < 0) return Array.Empty<TaskCandidate>();
         string json = raw.Substring(start, end - start + 1);
 
         try
         {
-            var parsed = JsonSerializer.Deserialize<List<RawIntent>>(json, JsonOpts);
-            if (parsed is null) return Array.Empty<DetectedIntent>();
+            var parsed = JsonSerializer.Deserialize<List<RawTask>>(json, JsonOpts);
+            if (parsed is null) return Array.Empty<TaskCandidate>();
 
-            var result = new List<DetectedIntent>(parsed.Count);
+            var result = new List<TaskCandidate>(parsed.Count);
             foreach (var r in parsed)
             {
-                if (string.IsNullOrWhiteSpace(r.Kind) || r.Kind == IntentSchema.NoIntent) continue;
-
-                var parameters = r.Parameters is null
-                    ? new Dictionary<string, string?>()
-                    : new Dictionary<string, string?>(r.Parameters);
-
-                result.Add(new DetectedIntent(
-                    Kind: r.Kind!,
-                    Parameters: parameters,
+                if (string.IsNullOrWhiteSpace(r.Title)) continue;
+                result.Add(new TaskCandidate(
+                    Title: r.Title!.Trim(),
+                    Description: NullIfBlank(r.Description),
+                    Owner: NullIfBlank(r.Owner),
+                    Deadline: NullIfBlank(r.Deadline),
                     Confidence: r.Confidence,
                     SourceQuote: r.SourceQuote ?? string.Empty));
             }
-
             return result;
         }
         catch (JsonException ex)
         {
-            Log.Warn($"intent JSON parse failed: {ex.Message}; raw=\"{Truncate(raw, 200)}\"");
-            return Array.Empty<DetectedIntent>();
+            Log.Warn($"task JSON parse failed: {ex.Message}; raw=\"{Truncate(raw, 200)}\"");
+            return Array.Empty<TaskCandidate>();
         }
     }
+
+    private static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 
     private static string Truncate(string s, int max) =>
         s.Length <= max ? s : s.Substring(0, max - 1) + "…";
 
-    private sealed class RawIntent
+    private sealed class RawTask
     {
-        [JsonPropertyName("kind")] public string? Kind { get; set; }
-        [JsonPropertyName("parameters")] public Dictionary<string, string?>? Parameters { get; set; }
+        [JsonPropertyName("title")] public string? Title { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("owner")] public string? Owner { get; set; }
+        [JsonPropertyName("deadline")] public string? Deadline { get; set; }
         [JsonPropertyName("confidence")] public double Confidence { get; set; }
         [JsonPropertyName("source_quote")] public string? SourceQuote { get; set; }
     }
